@@ -90,6 +90,11 @@ jobs:
 
       - name: Build Python backend
         run: |
+          PATCHRIGHT_DRIVER_DIR=$(python -c "import pathlib, patchright; print(pathlib.Path(patchright.__file__).parent / 'driver')")
+          PATCHRIGHT_NODE="$PATCHRIGHT_DRIVER_DIR/node"
+          if [ ! -f "$PATCHRIGHT_NODE" ]; then
+            PATCHRIGHT_NODE="$PATCHRIGHT_DRIVER_DIR/node.exe"
+          fi
           pyinstaller --onedir --name backend \
             --add-data "platforms:platforms" \
             --add-data "providers:providers" \
@@ -100,6 +105,8 @@ jobs:
             --add-data "api:api" \
             --add-data "services:services" \
             --add-data "static:static" \
+            --add-binary "$PATCHRIGHT_NODE:playwright/driver" \
+            --add-data "$PATCHRIGHT_DRIVER_DIR/package:playwright/driver/package" \
             --hidden-import uvicorn.logging \
             --hidden-import uvicorn.loops \
             --hidden-import uvicorn.loops.auto \
@@ -195,6 +202,9 @@ jobs:
       - name: Build Python backend
         shell: pwsh
         run: |
+          $driverDir = python -c "import pathlib, patchright; print(pathlib.Path(patchright.__file__).parent / 'driver')"
+          $nodePath = Join-Path $driverDir 'node.exe'
+          if (-not (Test-Path $nodePath)) { $nodePath = Join-Path $driverDir 'node' }
           pyinstaller --onedir --name backend `
             --add-data "platforms;platforms" `
             --add-data "providers;providers" `
@@ -205,6 +215,8 @@ jobs:
             --add-data "api;api" `
             --add-data "services;services" `
             --add-data "static;static" `
+            --add-binary "$nodePath;playwright/driver" `
+            --add-data "$driverDir/package;playwright/driver/package" `
             --hidden-import uvicorn.logging `
             --hidden-import uvicorn.loops `
             --hidden-import uvicorn.loops.auto `
