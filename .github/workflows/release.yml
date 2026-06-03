@@ -1,12 +1,61 @@
-name: Build & Release
+name: Build Desktop & Release
 
 on:
   push:
     tags:
-      - 'v*'  # 推送 v1.0.0 这样的 tag 时触发
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Desktop version without leading v, for example 1.0.1'
+        required: true
+        default: '1.0.1'
+      release_tag:
+        description: 'Release tag, defaults to v<version>'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            release_tag="$REF_NAME"
+            version="${REF_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+            release_tag="$INPUT_RELEASE_TAG"
+            if [ -z "$release_tag" ]; then
+              release_tag="v$version"
+            fi
+          fi
+
+          if [ -z "$version" ]; then
+            echo "version is required" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved release $release_tag with version $version"
+
   build-mac:
+    needs: prepare
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,32 +71,54 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
 
       - name: Install Playwright browsers
-        run: playwright install chromium
+        run: python -m playwright install chromium
 
       - name: Build frontend
         run: cd frontend && npm ci --legacy-peer-deps && npm run build
 
       - name: Inject version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          VERSION="${{ needs.prepare.outputs.version }}"
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "__version__ = \"$VERSION\"" > core/version.py
           cd electron && npm version --no-git-tag-version --allow-same-version "$VERSION"
 
       - name: Build Python backend
         run: |
-          pip install pyinstaller
           pyinstaller --onedir --name backend \
             --add-data "platforms:platforms" \
+            --add-data "providers:providers" \
+            --add-data "application:application" \
+            --add-data "infrastructure:infrastructure" \
+            --add-data "domain:domain" \
             --add-data "core:core" \
             --add-data "api:api" \
             --add-data "services:services" \
             --add-data "static:static" \
+            --hidden-import uvicorn.logging \
+            --hidden-import uvicorn.loops \
+            --hidden-import uvicorn.loops.auto \
+            --hidden-import uvicorn.protocols \
+            --hidden-import uvicorn.protocols.http \
+            --hidden-import uvicorn.protocols.http.auto \
+            --hidden-import uvicorn.protocols.websockets \
+            --hidden-import uvicorn.protocols.websockets.auto \
+            --hidden-import uvicorn.lifespan \
+            --hidden-import uvicorn.lifespan.on \
+            --hidden-import uvicorn.lifespan.off \
+            --hidden-import services.turnstile_solver.api_solver \
+            --hidden-import services.turnstile_solver.db_results \
+            --hidden-import services.turnstile_solver.browser_configs \
+            --hidden-import services.turnstile_solver.start \
             --collect-all browserforge \
             --collect-all camoufox \
+            --collect-all patchright \
+            --collect-all rich \
             --collect-all apify_fingerprint_datapoints \
             --collect-all language_tags \
             --collect-all ua_parser \
@@ -69,9 +140,9 @@ jobs:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
 
-      - name: Ad-hoc sign macOS app (avoid xattr -cr)
+      - name: Ad-hoc sign macOS app
         run: |
-          APP_PATH=$(find electron/dist -name "*.app" -maxdepth 2 | head -1)
+          APP_PATH=$(find electron/dist -maxdepth 2 -name "*.app" | head -1)
           if [ -n "$APP_PATH" ]; then
             codesign --force --deep --sign - "$APP_PATH"
             echo "Signed: $APP_PATH"
@@ -84,9 +155,12 @@ jobs:
           path: |
             electron/dist/*.dmg
             electron/dist/*.zip
+            electron/dist/*.yml
+            electron/dist/*.blockmap
           if-no-files-found: error
 
   build-win:
+    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,7 +176,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
 
       - name: Build frontend
         run: cd frontend && npm ci --legacy-peer-deps && npm run build
@@ -110,23 +186,44 @@ jobs:
       - name: Inject version
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $version = "${{ needs.prepare.outputs.version }}"
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
           "__version__ = `"$version`"" | Out-File -FilePath core/version.py -Encoding utf8
           cd electron
           npm version --no-git-tag-version --allow-same-version $version
 
       - name: Build Python backend
+        shell: pwsh
         run: |
-          pip install pyinstaller
           pyinstaller --onedir --name backend `
             --add-data "platforms;platforms" `
+            --add-data "providers;providers" `
+            --add-data "application;application" `
+            --add-data "infrastructure;infrastructure" `
+            --add-data "domain;domain" `
             --add-data "core;core" `
             --add-data "api;api" `
             --add-data "services;services" `
             --add-data "static;static" `
+            --hidden-import uvicorn.logging `
+            --hidden-import uvicorn.loops `
+            --hidden-import uvicorn.loops.auto `
+            --hidden-import uvicorn.protocols `
+            --hidden-import uvicorn.protocols.http `
+            --hidden-import uvicorn.protocols.http.auto `
+            --hidden-import uvicorn.protocols.websockets `
+            --hidden-import uvicorn.protocols.websockets.auto `
+            --hidden-import uvicorn.lifespan `
+            --hidden-import uvicorn.lifespan.on `
+            --hidden-import uvicorn.lifespan.off `
+            --hidden-import services.turnstile_solver.api_solver `
+            --hidden-import services.turnstile_solver.db_results `
+            --hidden-import services.turnstile_solver.browser_configs `
+            --hidden-import services.turnstile_solver.start `
             --collect-all browserforge `
             --collect-all camoufox `
+            --collect-all patchright `
+            --collect-all rich `
             --collect-all apify_fingerprint_datapoints `
             --collect-all language_tags `
             --collect-all ua_parser `
@@ -138,7 +235,6 @@ jobs:
             main.py
           New-Item -ItemType Directory -Force -Path electron/backend
           Copy-Item -Recurse dist/backend electron/backend/
-        shell: pwsh
 
       - name: Build Electron (Windows)
         run: |
@@ -153,11 +249,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: win-builds
-          path: electron/dist/*.exe
+          path: |
+            electron/dist/*.exe
+            electron/dist/*.yml
+            electron/dist/*.blockmap
           if-no-files-found: error
 
   build-docker:
+    needs: prepare
     runs-on: ubuntu-latest
+    continue-on-error: true
     permissions:
       contents: read
       packages: write
@@ -174,45 +275,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "image=ghcr.io/$repo" >> "$GITHUB_OUTPUT"
 
       - name: Inject version into source
-        run: echo '__version__ = "${{ steps.version.outputs.version }}"' > core/version.py
+        run: echo '__version__ = "${{ needs.prepare.outputs.version }}"' > core/version.py
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          build-args: APP_VERSION=${{ steps.version.outputs.version }}
+          build-args: APP_VERSION=${{ needs.prepare.outputs.version }}
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.image }}:latest
+            ${{ steps.image.outputs.image }}:${{ needs.prepare.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   release:
-    needs: [build-mac, build-win, build-docker]
+    needs: [prepare, build-mac, build-win]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download macOS builds
+      - name: Download desktop builds
         uses: actions/download-artifact@v4
         with:
-          name: mac-builds
+          pattern: '*-builds'
           path: dist/
+          merge-multiple: true
 
-      - name: Download Windows builds
-        uses: actions/download-artifact@v4
-        with:
-          name: win-builds
-          path: dist/
+      - name: List release files
+        run: ls -lah dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: aBaiAutoplus ${{ needs.prepare.outputs.release_tag }}
           files: dist/*
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

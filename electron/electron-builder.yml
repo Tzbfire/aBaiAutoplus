@@ -9,7 +9,7 @@ directories:
 # 自动更新：从 GitHub Releases 检查
 publish:
   provider: github
-  owner: asz798838958
+  owner: Tzbfire
   repo: aBaiAutoplus
 
 # 将 PyInstaller 产物和前端静态文件打包进 resources/
