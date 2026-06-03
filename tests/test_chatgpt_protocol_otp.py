@@ -16,7 +16,7 @@ class _FakeSession:
     def __init__(self):
         self.posts = []
 
-    def post(self, url, headers=None, data=None):
+    def post(self, url, headers=None, data=None, **kwargs):
         self.posts.append((url, headers or {}, data))
         return _JsonResponse()
 
@@ -24,6 +24,25 @@ class _FakeSession:
 class _SendOtpResponse:
     status_code = 200
     text = '{"ok":true}'
+
+    def json(self):
+        return {"ok": True}
+
+
+class _SendOtpPageStateResponse:
+    status_code = 200
+    text = '{"page":{"type":"email_otp_verification"}}'
+
+    def json(self):
+        return {"page": {"type": "email_otp_verification"}}
+
+
+class _ResendOtpResponse:
+    status_code = 200
+    text = '{"success":true}'
+
+    def json(self):
+        return {"success": True}
 
 
 class _EmailVerificationPageResponse:
@@ -139,3 +158,27 @@ def test_send_verification_code_visits_email_verification_page_before_send():
     assert calls[0][0] == "https://auth.openai.com/email-verification"
     assert calls[1][0].endswith("/api/accounts/email-otp/send")
     assert engine._email_otp_page_loaded is True
+
+
+def test_send_verification_code_resends_when_send_only_returns_page_state():
+    engine = _bare_engine()
+    engine._email_otp_continue_url = "https://auth.openai.com/email-verification"
+    calls = []
+
+    class SendSession:
+        def get(self, url, headers=None, timeout=None):
+            calls.append(("GET", url, headers or {}))
+            if len(calls) == 1:
+                return _EmailVerificationPageResponse()
+            return _SendOtpPageStateResponse()
+
+        def post(self, url, headers=None, data=None, json=None, allow_redirects=None, timeout=None):
+            calls.append(("POST", url, headers or {}))
+            return _ResendOtpResponse()
+
+    engine.session = SendSession()
+
+    assert engine._send_verification_code() is True
+    assert calls[1][1].endswith("/api/accounts/email-otp/send")
+    assert calls[2][1].endswith("/api/accounts/email-otp/resend")
+    assert engine._otp_sent_at is not None

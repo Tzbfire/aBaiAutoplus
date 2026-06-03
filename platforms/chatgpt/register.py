@@ -706,13 +706,22 @@ class RegistrationEngine:
 
             # 3. 调用 signin/openai 获取 authorize URL
 
-            signin_url = f"{CHATGPT_APP}/api/auth/signin/openai"
+            from urllib.parse import urlencode
 
-            if oai_did:
+            query = urlencode({
+                "prompt": "login",
+                "ext-oai-did": oai_did,
+                "auth_session_logging_id": str(uuid.uuid4()),
+                "screen_hint": "login_or_signup",
+                "login_hint": self.email or "",
+            })
+            signin_url = f"{CHATGPT_APP}/api/auth/signin/openai?{query}"
 
-                signin_url += f"?prompt=login&ext-oai-did={oai_did}"
-
-
+            form_data = urlencode({
+                "callbackUrl": f"{CHATGPT_APP}/",
+                "csrfToken": csrf_token,
+                "json": "true",
+            })
 
             signin_resp = self.session.post(
 
@@ -728,7 +737,7 @@ class RegistrationEngine:
 
                 },
 
-                data=f"callbackUrl={CHATGPT_APP}%2F&csrfToken={csrf_token}&json=true",
+                data=form_data,
 
                 timeout=15,
 
@@ -1451,9 +1460,7 @@ class RegistrationEngine:
 
 
 
-            # 记录发送时间戳
-
-            self._otp_sent_at = time.time()
+            # 发送时间只在 send/resend 明确成功后写入 _otp_sent_at。
 
 
 
@@ -1482,6 +1489,8 @@ class RegistrationEngine:
                 send_headers["x-csrf-token"] = csrf_token
 
 
+
+            should_try_resend = False
 
             last_error = ""
 
@@ -1529,19 +1538,99 @@ class RegistrationEngine:
 
                         body = response.json()
 
-                        if isinstance(body, dict):
-
-                            detail = body.get("detail") or body.get("error") or body.get("message") or ""
-
-                            if detail:
-
-                                self._log(f"验证码发送API返回消息: {detail}")
-
                     except Exception:
 
-                        pass
+                        body = {}
 
-                    return True
+                    if isinstance(body, dict):
+
+                        detail = body.get("detail") or body.get("error") or body.get("message") or ""
+
+                        if detail:
+
+                            self._log(f"验证码发送API返回消息: {detail}")
+
+                        if body.get("success") is True or body.get("ok") is True:
+
+                            self._otp_sent_at = time.time()
+
+                            return True
+
+                        page_type = str((body.get("page") or {}).get("type") or "")
+
+                        # OpenAI 现在经常返回 email_otp_verification 页面状态，
+                        # 但这不代表首封验证码已经实际投递。继续走 resend API，
+                        # resend 返回 {"success": true} 才作为真实发信成功。
+                        if page_type == "email_otp_verification":
+
+                            self._log("验证码 send API 仅返回邮箱验证页状态，继续调用 resend 触发真实投递", "warning")
+
+                            should_try_resend = True
+
+                            break
+
+                    else:
+
+                        self._otp_sent_at = time.time()
+
+                        return True
+
+                    self._log("验证码发送响应未确认投递成功，继续尝试 resend", "warning")
+
+                    should_try_resend = True
+
+                    break
+
+
+
+                # 如果 GET 返回 405/404，先尝试 POST；这个判断必须放在通用 4xx 前面。
+                if status in (405, 404) and attempt == 0:
+
+                    self._log("GET 失败，尝试 POST 方式发送验证码...")
+
+                    try:
+
+                        response = self.session.post(
+
+                            OPENAI_API_ENDPOINTS["send_otp"],
+
+                            headers={**send_headers, "origin": "https://auth.openai.com", "content-type": "application/json"},
+
+                            json={},
+
+                            timeout=15,
+
+                        )
+
+                        self._log(f"POST 验证码发送状态: {response.status_code}")
+
+                        self._log(f"POST 验证码发送响应: {response.text[:200]}")
+
+                        if response.status_code == 200:
+
+                            try:
+
+                                body = response.json()
+
+                            except Exception:
+
+                                body = {}
+
+                            if not isinstance(body, dict) or body.get("success") is True or body.get("ok") is True:
+
+                                self._otp_sent_at = time.time()
+
+                                return True
+
+                            if str((body.get("page") or {}).get("type") or "") == "email_otp_verification":
+
+                                should_try_resend = True
+
+                                break
+
+                    except Exception as post_err:
+
+                        self._log(f"POST 验证码发送异常: {post_err}", "warning")
 
 
 
@@ -1561,45 +1650,83 @@ class RegistrationEngine:
 
 
 
-                # 如果 GET 返回 405/404，尝试 POST
-
-                if status in (405, 404) and attempt == 0:
-
-                    self._log("GET 失败，尝试 POST 方式发送验证码...")
-
-                    try:
-
-                        response = self.session.post(
-
-                            OPENAI_API_ENDPOINTS["send_otp"],
-
-                            headers={**send_headers, "content-type": "application/json"},
-
-                            json={},
-
-                            timeout=15,
-
-                        )
-
-                        self._log(f"POST 验证码发送状态: {response.status_code}")
-
-                        self._log(f"POST 验证码发送响应: {response.text[:200]}")
-
-                        if response.status_code == 200:
-
-                            return True
-
-                    except Exception as post_err:
-
-                        self._log(f"POST 验证码发送异常: {post_err}", "warning")
-
-
-
                 last_error = f"HTTP {status}: {resp_text}"
 
                 if attempt == 0:
 
                     time.sleep(2)
+
+
+
+            if should_try_resend:
+
+                try:
+
+                    resend_headers = {
+
+                        "referer": email_verification_url,
+
+                        "origin": "https://auth.openai.com",
+
+                        "accept": "*/*",
+
+                        "sec-fetch-site": "same-origin",
+
+                        "sec-fetch-mode": "cors",
+
+                        "sec-fetch-dest": "empty",
+
+                        **_generate_datadog_trace_headers(),
+
+                    }
+
+                    if self._device_id:
+
+                        resend_headers["oai-device-id"] = self._device_id
+
+                    response = self.session.post(
+
+                        OPENAI_API_ENDPOINTS["resend_otp"],
+
+                        headers=resend_headers,
+
+                        allow_redirects=True,
+
+                        timeout=15,
+
+                    )
+
+                    self._log(f"验证码重发状态: {response.status_code}")
+
+                    self._log(f"验证码重发响应: {response.text[:200]}")
+
+                    if response.status_code == 200:
+
+                        try:
+
+                            body = response.json()
+
+                        except Exception:
+
+                            body = {}
+
+                        if not isinstance(body, dict) or body.get("success") is True or body.get("ok") is True:
+
+                            self._otp_sent_at = time.time()
+
+                            return True
+
+                        last_error = f"resend 未确认成功: {response.text[:200]}"
+
+                    else:
+
+                        last_error = f"resend HTTP {response.status_code}: {response.text[:200]}"
+
+                except Exception as resend_err:
+
+                    last_error = str(resend_err)
+
+                    self._log(f"验证码重发异常: {resend_err}", "warning")
 
 
 
